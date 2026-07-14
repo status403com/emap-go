@@ -21,6 +21,14 @@ type Manager struct {
 	mu       sync.Mutex
 	sessions map[credKey]*session
 	linger   time.Duration
+	// ForcePolling disables IDLE even when the server supports it, falling
+	// back to polling at PollInterval. Useful when the server's IDLE
+	// notifications are unreliably delayed (e.g. Gmail).
+	ForcePolling bool
+	// PollInterval is how long the polling fallback waits between FETCH
+	// cycles. Per credential, not per subscriber. Zero uses
+	// DefaultPollInterval (3s).
+	PollInterval time.Duration
 	// dial overrides the real network dialer. nil = use dialIMAPConn. Set
 	// only by tests via withDial.
 	dial dialFunc

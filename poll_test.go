@@ -8,10 +8,6 @@ import (
 )
 
 func TestPollLoopFetchesPeriodically(t *testing.T) {
-	prev := PollInterval
-	PollInterval = 30 * time.Millisecond
-	defer func() { PollInterval = prev }()
-
 	srv := newFakeServer()
 	srv.script = func(fc *fakeConn) {
 		handleNoIdleBringUp(fc, 100)
@@ -23,6 +19,7 @@ func TestPollLoopFetchesPeriodically(t *testing.T) {
 	}
 
 	m := NewManager(time.Hour).withDial(srv.dialer())
+	m.PollInterval = 30 * time.Millisecond
 	defer m.Shutdown()
 
 	sub, err := m.Subscribe(sampleCred("inbox@example.com"), Filter{})
@@ -40,10 +37,6 @@ func TestPollLoopFetchesPeriodically(t *testing.T) {
 }
 
 func TestPollLoopDeliversNewMail(t *testing.T) {
-	prev := PollInterval
-	PollInterval = 25 * time.Millisecond
-	defer func() { PollInterval = prev }()
-
 	srv := newFakeServer()
 	var fetchN atomic.Int32
 	srv.script = func(fc *fakeConn) {
@@ -80,6 +73,7 @@ func TestPollLoopDeliversNewMail(t *testing.T) {
 	}
 
 	m := NewManager(time.Hour).withDial(srv.dialer())
+	m.PollInterval = 25 * time.Millisecond
 	defer m.Shutdown()
 
 	sub, err := m.Subscribe(sampleCred("inbox@example.com"), Filter{
@@ -107,10 +101,6 @@ func TestPollLoopDeliversNewMail(t *testing.T) {
 }
 
 func TestPollLoopReconnectsAfterConnDrop(t *testing.T) {
-	prevPoll := PollInterval
-	PollInterval = 30 * time.Millisecond
-	defer func() { PollInterval = prevPoll }()
-
 	prevBackoff := ReconnectInitialBackoff
 	ReconnectInitialBackoff = 10 * time.Millisecond
 	defer func() { ReconnectInitialBackoff = prevBackoff }()
@@ -155,6 +145,7 @@ func TestPollLoopReconnectsAfterConnDrop(t *testing.T) {
 	}
 
 	m := NewManager(time.Hour).withDial(srv.dialer())
+	m.PollInterval = 30 * time.Millisecond
 	defer m.Shutdown()
 
 	sub, err := m.Subscribe(sampleCred("inbox@example.com"), Filter{To: "alice@example.com"})
@@ -186,10 +177,6 @@ func TestPollLoopReconnectsAfterConnDrop(t *testing.T) {
 }
 
 func TestPollLoopStopsOnDisconnect(t *testing.T) {
-	prev := PollInterval
-	PollInterval = 200 * time.Millisecond
-	defer func() { PollInterval = prev }()
-
 	srv := newFakeServer()
 	srv.script = func(fc *fakeConn) {
 		handleNoIdleBringUp(fc, 100)
@@ -201,6 +188,7 @@ func TestPollLoopStopsOnDisconnect(t *testing.T) {
 	}
 
 	m := NewManager(time.Hour).withDial(srv.dialer())
+	m.PollInterval = 200 * time.Millisecond
 
 	sub, err := m.Subscribe(sampleCred("inbox@example.com"), Filter{})
 	if err != nil {

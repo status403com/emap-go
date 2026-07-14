@@ -156,6 +156,9 @@ func (s *session) fetchNewMessages(c *imapConn) error {
 
 	maxUID := since
 	for _, r := range resps {
+		if r.uid <= since {
+			continue
+		}
 		if r.uid > maxUID {
 			maxUID = r.uid
 		}

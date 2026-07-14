@@ -16,12 +16,10 @@ import (
 // production clients use. Var (not const) so tests can shorten it.
 var IdleRoundDuration = 25 * time.Minute
 
-// PollInterval is how long the polling fallback waits between FETCH cycles
-// on servers that don't support IDLE. 30s is a reasonable compromise
-// between new-mail latency (≤ 30s) and server load. Per credential — not
-// per task — so two thousand tasks on five inboxes equals five polls per
-// 30s, not 2000.
-var PollInterval = 30 * time.Second
+// DefaultPollInterval is the default polling cadence when IDLE is
+// unavailable or ForcePolling is set. Override per-Manager via
+// Manager.PollInterval.
+const DefaultPollInterval = 3 * time.Second
 
 // Reconnect backoff parameters. When the IDLE loop hits a transient conn
 // error, it retries with exponential backoff starting at ReconnectInitialBackoff
@@ -301,7 +299,7 @@ func (s *session) startIdleLoop() {
 	}
 	s.idleCtx, s.idleCancel = context.WithCancel(context.Background())
 	s.idleDone = make(chan struct{})
-	if c.Capable("IDLE") {
+	if c.Capable("IDLE") && !s.manager.ForcePolling {
 		go s.runIdleLoop(s.idleCtx, c)
 	} else {
 		go s.runPollLoop(s.idleCtx, c)
@@ -333,7 +331,11 @@ func (s *session) stopIdleLoop() {
 func (s *session) runPollLoop(parentCtx context.Context, c *imapConn) {
 	defer close(s.idleDone)
 
-	ticker := time.NewTicker(PollInterval)
+	interval := s.manager.PollInterval
+	if interval <= 0 {
+		interval = DefaultPollInterval
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for parentCtx.Err() == nil {

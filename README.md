@@ -130,6 +130,26 @@ case <-ctx.Done():
 }
 ```
 
+## Polling vs IDLE
+
+By default emap-go uses IMAP IDLE for push-style delivery when the server
+supports it, falling back to polling when it doesn't.
+
+**Gmail and IDLE latency:** Gmail's IMAP server delays IDLE EXISTS
+notifications by 20–60 seconds, even though the same mail appears instantly
+in the Gmail web UI and mobile apps (which use a proprietary push channel,
+not IMAP IDLE). If you need lower latency on Gmail, force polling mode —
+at a 3-second interval the worst-case delay drops from ~60s to ~3s:
+
+```go
+mgr := emap.NewManager(emap.DefaultLinger)
+mgr.ForcePolling = true              // skip IDLE, poll instead
+mgr.PollInterval = 5 * time.Second   // default is 3s
+```
+
+Polling is per-credential, not per-subscriber — 2000 tasks on one inbox
+still means one FETCH every interval, not 2000.
+
 ## Configuration
 
 All knobs are package-level vars and can be tuned before constructing a
@@ -138,7 +158,7 @@ Manager. Sensible defaults for production:
 ```go
 emap.DefaultLinger              // 60s — how long a session stays warm after the last unsubscribe
 emap.IdleRoundDuration          // 25 min — IDLE re-issue cadence (RFC 2177 limit is 29 min)
-emap.PollInterval               // 30s — fallback poll cadence when server lacks IDLE
+mgr.PollInterval                //  3s — poll cadence (used when IDLE unavailable or ForcePolling set)
 emap.ReconnectInitialBackoff    //  1s — first reconnect retry delay
 emap.ReconnectMaxBackoff        // 60s — reconnect retry cap
 emap.ConnDialTimeout            // 10s — TCP/TLS handshake limit
