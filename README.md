@@ -2,6 +2,7 @@
 
 A high-fanout IMAP client for Go, built for workloads where many independent
 tasks need to read mail from a small set of inboxes.
+
 📖 [Technical write-up](https://status403.com/blog/emap-go-high-fanout-imap?utm_source=github&utm_medium=referral&utm_campaign=emap-technical)
 
 ```
