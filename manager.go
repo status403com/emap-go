@@ -125,7 +125,7 @@ func (m *Manager) teardown(s *session) {
 	}
 	s.lingerTimer = nil
 	delete(m.sessions, s.key)
-	s.disconnect()
+	s.disconnect(nil)
 }
 
 // Shutdown disconnects every active session immediately. Called at app exit
@@ -143,8 +143,26 @@ func (m *Manager) Shutdown() {
 	}
 	m.mu.Unlock()
 	for _, s := range live {
-		s.disconnect()
+		s.disconnect(nil)
 	}
+}
+
+// evict removes a session whose watch loop hit a condition reconnecting
+// can't fix (sign-in required) and closes its subscriptions with cause, so
+// the next Subscribe for the credential builds a fresh session instead of
+// joining the dead one. No-op if teardown or Shutdown already removed it.
+func (m *Manager) evict(s *session, cause error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.sessions[s.key] != s {
+		return
+	}
+	if s.lingerTimer != nil {
+		s.lingerTimer.Stop()
+		s.lingerTimer = nil
+	}
+	delete(m.sessions, s.key)
+	s.disconnect(cause)
 }
 
 // activeSessions reports the number of live sessions. Test-only.

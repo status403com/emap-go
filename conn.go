@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -158,6 +159,16 @@ func (c *imapConn) exec(cmd string) (string, []string, error) {
 	}
 }
 
+// authenticate runs whichever auth exchange the credential calls for:
+// XOAUTH2 with token (from bearerToken) when an OAuth2 token source is
+// configured, LOGIN otherwise.
+func (c *imapConn) authenticate(cred Credential, token string) error {
+	if cred.OAuth2 == nil {
+		return c.login(cred.Email, cred.Password)
+	}
+	return c.authenticateXOAuth2(cred.Email, token)
+}
+
 // login authenticates the connection. Quotes in credentials are escaped per
 // RFC 3501 §4.3 quoted-string rules.
 func (c *imapConn) login(email, password string) error {
@@ -167,6 +178,49 @@ func (c *imapConn) login(email, password string) error {
 		return err
 	}
 	return expectOK(tag, lines, "LOGIN")
+}
+
+// authenticateXOAuth2 runs `AUTHENTICATE XOAUTH2` (the SASL bearer mechanism
+// used by Microsoft and Google). Uses the two-step form — wait for the `+`
+// continuation, then send the initial response — so it works whether or not
+// the server advertises SASL-IR. On rejection the server sends a second
+// continuation carrying a base64 JSON error; the mechanism requires an empty
+// client response before the server emits the tagged NO.
+func (c *imapConn) authenticateXOAuth2(user, token string) error {
+	c.execMu.Lock()
+	defer c.execMu.Unlock()
+
+	tag := c.nextTag()
+	if ConnCommandTimeout > 0 {
+		_ = c.conn.SetDeadline(time.Now().Add(ConnCommandTimeout))
+		defer func() { _ = c.conn.SetDeadline(time.Time{}) }()
+	}
+
+	if _, err := c.conn.Write([]byte(tag + " AUTHENTICATE XOAUTH2\r\n")); err != nil {
+		return fmt.Errorf("write AUTHENTICATE: %w", err)
+	}
+	payload := base64.StdEncoding.EncodeToString(
+		[]byte("user=" + user + "\x01auth=Bearer " + token + "\x01\x01"))
+	sent := false
+	for {
+		line, err := c.readResponseLine()
+		if err != nil {
+			return fmt.Errorf("read response to AUTHENTICATE: %w", err)
+		}
+		if strings.HasPrefix(line, tag+" ") {
+			return expectOK(tag, []string{line}, "AUTHENTICATE XOAUTH2")
+		}
+		if !strings.HasPrefix(line, "+") {
+			continue // untagged data (e.g. CAPABILITY) — irrelevant here
+		}
+		resp := ""
+		if !sent {
+			resp, sent = payload, true
+		}
+		if _, err := c.conn.Write([]byte(resp + "\r\n")); err != nil {
+			return fmt.Errorf("write AUTHENTICATE response: %w", err)
+		}
+	}
 }
 
 // selectFolder issues SELECT for a mailbox. Caller is expected to remember

@@ -6,7 +6,7 @@ tasks need to read mail from a small set of inboxes.
 📖 [Technical write-up](https://status403.com/blog/emap-go-high-fanout-imap?utm_source=github&utm_medium=referral&utm_campaign=emap-technical)
 
 ```
-import "github.com/status403com/emap-go"
+import "github.com/status403com/emap-go/v2"
 ```
 
 ## The problem this solves
@@ -55,7 +55,7 @@ import (
     "log"
     "time"
 
-    "github.com/status403com/emap-go"
+    "github.com/status403com/emap-go/v2"
 )
 
 func main() {
@@ -132,6 +132,75 @@ case <-ctx.Done():
 }
 ```
 
+## Microsoft Outlook / Hotmail / Microsoft 365
+
+Microsoft mailboxes reject password `LOGIN` (`NO Basic authentication is
+disabled`) and require OAuth2, which emap-go speaks via SASL `XOAUTH2` when
+`Credential.OAuth2` is set.
+
+Prerequisite: a Microsoft Entra app registration with
+
+- supported account types that include the mailbox (personal Microsoft
+  accounts for `@hotmail.com` / `@outlook.com` / `@live.com`),
+- **Allow public client flows** enabled (Authentication → Advanced settings),
+- the delegated API permission *Office 365 Exchange Online →
+  IMAP.AccessAsUser.All*.
+
+Sign the mailbox owner in once with the device-code flow and persist the
+refresh token:
+
+```go
+oauth := emap.MicrosoftOAuth{ClientID: "<application-client-id>"}
+
+dc, err := oauth.StartDeviceLogin(ctx)
+if err != nil { return err }
+// Hand the code to your UI. dc.Message is Microsoft's ready-made text:
+// "To sign in, open https://microsoft.com/devicelogin and enter …"
+show(dc.UserCode, dc.VerificationURI, dc.ExpiresAt)
+
+refreshToken, err := dc.Wait(ctx) // blocks until the owner signs in
+if err != nil { return err }
+saveRefreshToken(refreshToken)
+```
+
+Then connect with the token source instead of a password:
+
+```go
+cred := emap.Credential{
+    Host:   "outlook.office365.com",
+    Port:   993,
+    UseTLS: true,
+    Email:  "someone@hotmail.com",
+    OAuth2: oauth.TokenSource(loadRefreshToken(), saveRefreshToken),
+}
+```
+
+The token source caches each access token until shortly before expiry and
+refreshes on demand (initial connect and every reconnect). Microsoft rotates
+refresh tokens on use; the `onRotate` callback (`saveRefreshToken` above)
+receives each new one so the next process start doesn't present a stale
+token. Any other provider works too: implement `emap.TokenSource`.
+
+When the refresh token is expired or revoked, or Microsoft demands new
+interaction (MFA, consent), the error is an `*emap.ReauthRequiredError`
+naming the mailbox (`Host`, `Port`, `Email`); it also matches
+`errors.Is(err, emap.ErrReauthRequired)`. The library never retries it:
+
+- `Subscribe` and `TestLogin` return it directly.
+- A live session that hits it on reconnect is evicted: every subscription's
+  `Ch` closes and `sub.Err()` returns the error.
+
+```go
+var reauth *emap.ReauthRequiredError
+if errors.As(err, &reauth) {          // err from Subscribe, or sub.Err() after Ch closed
+    promptSignIn(reauth.Email)        // StartDeviceLogin → Wait → save the new refresh token
+}
+```
+
+After the new sign-in, `Subscribe` with the new token source builds a fresh
+session. `Mailbox.Watch` callers only see the channel close; their next
+`Watch` returns the error.
+
 ## Polling vs IDLE
 
 By default emap-go uses IMAP IDLE for push-style delivery when the server
@@ -172,10 +241,13 @@ emap.ConnCommandTimeout         // 30s — per-command read limit (does not appl
 
 | Type | Purpose |
 |---|---|
-| `Credential` | Mailbox identity: host/port/TLS/email/password. |
+| `Credential` | Mailbox identity: host/port/TLS/email plus password or OAuth2 token source. |
+| `TokenSource` | Supplies OAuth2 access tokens for XOAUTH2 (`Token(ctx)`). |
+| `ReauthRequiredError` | Names the mailbox that needs a new sign-in; matches `ErrReauthRequired`. |
+| `MicrosoftOAuth` | Device-code sign-in and refreshing token source for Outlook / Microsoft 365. |
 | `Manager` | Connection pool. One per process. |
 | `Mailbox` | Credential-bound subscription factory; auto-closes on ctx cancel. |
-| `Subscription` | Live mail stream + Close. |
+| `Subscription` | Live mail stream + Close; `Err()` says why the library closed `Ch`. |
 | `Filter` | To / FromContains / Since / MaxAge selectors. |
 | `Message` | UID / To / From / Subject / Date / Body. |
 
@@ -185,7 +257,10 @@ emap.ConnCommandTimeout         // 30s — per-command read limit (does not appl
 | `(*Manager).Subscribe(cred, filter) (*Subscription, error)` | Open a new subscription. |
 | `(*Manager).Shutdown()` | Close everything cleanly. |
 | `NewMailbox(mgr, cred) Mailbox` | Wrap a credential for `Watch(ctx, filter)`. |
-| `TestLogin(host, port, useTLS, email, password) error` | One-shot credential check. |
+| `TestLogin(cred) error` | One-shot credential check (LOGIN or XOAUTH2). |
+| `(MicrosoftOAuth).StartDeviceLogin(ctx) (*DeviceCode, error)` | Begin device-code sign-in; returns the code to display. |
+| `(*DeviceCode).Wait(ctx) (refreshToken, error)` | Block until the owner approves (or declines / code expires). |
+| `(MicrosoftOAuth).TokenSource(refreshToken, onRotate) TokenSource` | Caching, refreshing XOAUTH2 token source. |
 
 ## How it skips backlog
 
@@ -205,7 +280,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for full design details.
 
 ## Status
 
-- 59 tests under `-race`, stable across repeated runs.
+- 67 tests under `-race`, stable across repeated runs.
 - No known leaks under 2000-subscription stress.
 - Production-grade in terms of correctness; not yet battle-tested at scale
   in the wild — please report issues.

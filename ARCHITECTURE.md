@@ -69,7 +69,9 @@
 ```
 
 - Credential identity for the pool key is `(host, port, lowercased email)`.
-  Password is excluded — rotating the password reuses the same session entry.
+  Password and OAuth2 are excluded, so changing either doesn't fork a second
+  connection; a session already in the pool keeps the secret it was created
+  with until it is torn down (or evicted when sign-in is required).
 - Each `Manager.Subscribe` is a refcount increment, not a new connection.
 - `Subscription.Close` is a refcount decrement. When refs hits zero, a 60-second
   linger timer starts. A new `Subscribe` within that window cancels the timer
@@ -112,6 +114,7 @@ is sacrificed in this edge case to preserve the "bounded memory" invariant.
 | Transport (closed pipe, write error, read EOF) | underlying conn error during exec/idle | exponential backoff reconnect; sinceUID preserved; force-FETCH on resume to catch mail from outage |
 | Protocol-level IDLE rejection (BAD/NO continuation, non-OK terminator) | `errIDLERejected` sentinel | exit watch loop cleanly; do NOT reconnect (a fresh conn hits the same rejection) |
 | Parent ctx cancel during reconnect backoff | `ctx.Done()` in `time.NewTimer` select | abandon retries, close watch loop, let teardown finish |
+| OAuth2 token source needs a new sign-in (revoked/expired refresh token, MFA) | `ErrReauthRequired` from `TokenSource.Token` | do NOT retry; evict the session from the pool, close subscriber channels with `Subscription.Err` = `*ReauthRequiredError`; next `Subscribe` builds a fresh session |
 
 Backoff doubles: 1s → 2s → 4s → … capped at 60s. Reconnect attempts are
 cancellable; `Manager.Shutdown` interrupts a mid-backoff retry within
@@ -191,7 +194,9 @@ on the order of *(unique credentials × 9 KB) + (subscriptions × 200 B)*.
   me from anywhere." Filter handles the common case in 5 fields.
 - **MIME decoding.** Bodies are returned raw. If you need decoded HTML or
   attachments, wrap with `net/mail` or `enmime` at the call site.
-- **OAuth2 (XOAUTH2).** Most catch-alls run on hosted servers using app
-  passwords. If/when a real need arises, the LOGIN path generalizes cleanly.
+- **OAuth2 for providers other than Microsoft.** XOAUTH2 is implemented
+  generically behind `TokenSource`; only Microsoft's device-code sign-in and
+  refresh flow ships in-tree, because Microsoft mailboxes reject `LOGIN`
+  outright. Gmail and others still accept app passwords.
 - **STARTTLS.** TLS-from-the-start (port 993) only. Modern providers don't
   support cleartext-to-STARTTLS upgrades anyway.

@@ -74,12 +74,20 @@ type Subscription struct {
 	filter Filter
 	closer func()
 	once   sync.Once
+	err    error
 }
 
 // Close removes this subscription from its session and decrements the
 // session's refcount. Safe to call multiple times.
 func (s *Subscription) Close() {
 	s.once.Do(s.closer)
+}
+
+// Err reports why the library closed Ch: a *ReauthRequiredError (matching
+// ErrReauthRequired) when the mailbox owner must sign in again, nil after
+// Close, linger teardown, or Shutdown. Only meaningful once Ch is closed.
+func (s *Subscription) Err() error {
+	return s.err
 }
 
 // Session state values. Compared/stored via sync/atomic on session.state.
@@ -186,26 +194,27 @@ func toKey(addr string) string {
 // mailboxes (no MOVE / Spam handling yet).
 const inboxFolder = "INBOX"
 
-// connect runs the full bring-up sequence: dial → LOGIN → CAPABILITY →
-// SELECT INBOX. Leaves the session in sessionStateActive on success and
-// starts the IDLE loop.
+// connect runs the full bring-up sequence: dial → LOGIN/AUTHENTICATE →
+// CAPABILITY → SELECT INBOX. Leaves the session in sessionStateActive on
+// success and starts the IDLE loop.
 func (s *session) connect() error {
-	if err := s.establish(false); err != nil {
+	if err := s.establish(context.Background(), false); err != nil {
 		return err
 	}
 	s.startIdleLoop()
 	return nil
 }
 
-// establish performs the actual dial + auth + SELECT. Shared between the
-// initial connect path (called from Manager.Subscribe) and the in-loop
-// reconnect path (called from runIdleLoop, which is its own goroutine and
-// must NOT touch the IDLE loop lifecycle).
+// establish performs the actual token fetch + dial + auth + SELECT. Shared
+// between the initial connect path (called from Manager.Subscribe) and the
+// in-loop reconnect path (called from runIdleLoop, which is its own
+// goroutine and must NOT touch the IDLE loop lifecycle). ctx bounds the
+// OAuth2 token fetch so a shutdown mid-reconnect isn't stuck behind it.
 //
 // isReconnect=true: close any stale conn first, restore the previously
 // selected folder if it wasn't INBOX. isReconnect=false: assume no
 // pre-existing conn.
-func (s *session) establish(isReconnect bool) error {
+func (s *session) establish(ctx context.Context, isReconnect bool) error {
 	var prevFolder string
 	if isReconnect {
 		s.connMu.Lock()
@@ -218,6 +227,11 @@ func (s *session) establish(isReconnect bool) error {
 		}
 	}
 
+	token, err := bearerToken(ctx, s.cred)
+	if err != nil {
+		return err
+	}
+
 	dial := s.dial
 	if dial == nil {
 		dial = dialIMAPConn
@@ -227,9 +241,9 @@ func (s *session) establish(isReconnect bool) error {
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
 	}
-	if err := c.login(s.cred.Email, s.cred.Password); err != nil {
+	if err := c.authenticate(s.cred, token); err != nil {
 		_ = c.Close()
-		return fmt.Errorf("login: %w", err)
+		return fmt.Errorf("authenticate: %w", err)
 	}
 	if err := c.capability(); err != nil {
 		_ = c.Close()
@@ -455,7 +469,7 @@ func (s *session) reconnect() error {
 		return fmt.Errorf("session closed")
 	}
 	s.stopIdleLoop()
-	if err := s.establish(true); err != nil {
+	if err := s.establish(context.Background(), true); err != nil {
 		return err
 	}
 	s.startIdleLoop()
@@ -466,11 +480,11 @@ func (s *session) reconnect() error {
 // the IDLE loop. Designed for use FROM the IDLE loop itself — the loop
 // continues running on the returned new conn. Returns the fresh *imapConn
 // so the caller can update its local reference.
-func (s *session) reconnectInPlace() (*imapConn, error) {
+func (s *session) reconnectInPlace(ctx context.Context) (*imapConn, error) {
 	if s.state.Load() == sessionStateClosed {
 		return nil, fmt.Errorf("session closed")
 	}
-	if err := s.establish(true); err != nil {
+	if err := s.establish(ctx, true); err != nil {
 		return nil, err
 	}
 	s.connMu.Lock()
@@ -483,12 +497,23 @@ func (s *session) reconnectInPlace() (*imapConn, error) {
 // context is canceled. Wait between attempts doubles starting at
 // ReconnectInitialBackoff, capped at ReconnectMaxBackoff. Returns the new
 // conn and true on success; nil + false if the caller's ctx canceled first
-// (loop should exit).
+// or sign-in is required (loop should exit either way).
+//
+// ErrReauthRequired is the one establish error retrying can't fix, so it
+// evicts the session instead: subscribers see Ch close with Err set, and
+// the next Subscribe builds a fresh session with whatever TokenSource the
+// caller now supplies. Eviction runs on its own goroutine because
+// disconnect joins this loop.
 func (s *session) reconnectWithBackoff(ctx context.Context) (*imapConn, bool) {
 	delay := ReconnectInitialBackoff
 	for ctx.Err() == nil {
-		if c, err := s.reconnectInPlace(); err == nil {
+		c, err := s.reconnectInPlace(ctx)
+		if err == nil {
 			return c, true
+		}
+		if errors.Is(err, ErrReauthRequired) {
+			go s.manager.evict(s, err)
+			return nil, false
 		}
 		// Wait with cancellation. timer.Stop avoids the timer leaking when
 		// ctx fires first.
@@ -508,12 +533,13 @@ func (s *session) reconnectWithBackoff(ctx context.Context) (*imapConn, bool) {
 }
 
 // disconnect closes the underlying conn (best-effort LOGOUT) and forcibly
-// closes all subscriber channels. Idempotent; safe from teardown/Shutdown.
+// closes all subscriber channels, recording cause for Subscription.Err (nil
+// for ordinary teardown/Shutdown). Idempotent; safe from teardown/Shutdown.
 //
 // Order matters: stop the IDLE loop first so LOGOUT doesn't deadlock on
 // execMu (idle holds it for the full IDLE duration). After the loop joins,
 // the conn is free for the LOGOUT round-trip before Close.
-func (s *session) disconnect() {
+func (s *session) disconnect(cause error) {
 	s.state.Store(sessionStateClosed)
 
 	s.stopIdleLoop()
@@ -529,6 +555,7 @@ func (s *session) disconnect() {
 
 	s.subsMu.Lock()
 	for sub := range s.subs {
+		sub.err = cause // published to readers by the close below
 		close(sub.ch)
 		delete(s.subs, sub)
 	}
