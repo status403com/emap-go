@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -51,6 +52,14 @@ type Filter struct {
 	// now-MaxAge at dispatch time. Useful as a sanity gate ("verification
 	// mail is meaningless after 5 minutes"). Zero disables.
 	MaxAge time.Duration
+	// Backfill, when true AND Since is non-zero, makes the subscription
+	// replay mail that arrived before it subscribed: a one-time UID SEARCH
+	// SINCE the day before Since (narrowed by To/FromContains), capped to
+	// the newest 500 hits, run asynchronously on the watch loop shortly after
+	// Subscribe returns. Matching mail is delivered to this subscription only,
+	// each message once (live delivery covers anything newer). Does not move
+	// sinceUID or affect other subscribers. Default false = live-only.
+	Backfill bool
 }
 
 // Message is the parsed shape delivered to subscribers. Body is the decoded
@@ -75,6 +84,9 @@ type Subscription struct {
 	closer func()
 	once   sync.Once
 	err    error
+	// backfillMax is the highest UID dispatched before this subscription
+	// registered; its backfill delivers only UIDs at or below it.
+	backfillMax uint32
 }
 
 // Close removes this subscription from its session and decrements the
@@ -167,6 +179,18 @@ type session struct {
 	// Guarded by idleMu so the handler doesn't race with round setup.
 	idleMu          sync.Mutex
 	idleRoundCancel context.CancelFunc
+
+	// dispatchedMax is the highest UID handed to dispatch (or skipped as
+	// backlog at init). Guarded by subsMu, so a subscription reading it at
+	// registration splits UIDs exactly into "already dispatched" (backfill
+	// delivers) and "dispatched later" (live delivers).
+	dispatchedMax uint32
+
+	// backfillQueue holds subscriptions with Filter.Backfill awaiting their
+	// one-time historical fetch. Drained on the watch-loop goroutine so all
+	// conn I/O stays serialized there, like fetchNewMessages.
+	backfillMu    sync.Mutex
+	backfillQueue []*Subscription
 
 	// dial is overridable from tests. nil = use the real dialIMAPConn.
 	dial dialFunc
@@ -288,6 +312,9 @@ func (s *session) initSinceUID(c *imapConn) {
 		return
 	}
 	if c.uidNext > 0 {
+		s.subsMu.Lock()
+		s.dispatchedMax = c.uidNext - 1
+		s.subsMu.Unlock()
 		s.sinceUID.Store(c.uidNext - 1)
 		s.sinceUIDInitialized.Store(true)
 	}
@@ -353,7 +380,11 @@ func (s *session) runPollLoop(parentCtx context.Context, c *imapConn) {
 	defer ticker.Stop()
 
 	for parentCtx.Err() == nil {
-		if err := s.fetchNewMessages(c); err != nil && parentCtx.Err() == nil {
+		err := s.drainBackfill(parentCtx, c)
+		if err == nil {
+			err = s.fetchNewMessages(c)
+		}
+		if err != nil && parentCtx.Err() == nil {
 			newC, ok := s.reconnectWithBackoff(parentCtx)
 			if !ok {
 				return
@@ -381,11 +412,29 @@ func (s *session) runIdleLoop(parentCtx context.Context, c *imapConn) {
 	defer close(s.idleDone)
 
 	for parentCtx.Err() == nil {
+		if err := s.drainBackfill(parentCtx, c); err != nil && parentCtx.Err() == nil {
+			// The conn may be mid-response; replace it before IDLE reads
+			// leftover FETCH data as a rejection. The failed backfill is
+			// requeued and retried on the next iteration.
+			newC, ok := s.reconnectWithBackoff(parentCtx)
+			if !ok {
+				return
+			}
+			c = newC
+			s.handlePendingFetch(c) // catch mail from the outage
+			continue
+		}
+
 		roundCtx, roundCancel := context.WithTimeout(parentCtx, IdleRoundDuration)
 
 		s.idleMu.Lock()
 		s.idleRoundCancel = roundCancel
 		s.idleMu.Unlock()
+		// A backfill enqueued between the drain above and publishing
+		// roundCancel would otherwise wait out a full IDLE round.
+		if s.backfillPending() {
+			roundCancel()
+		}
 
 		err := c.idle(roundCtx, s.handleIdleLine)
 
@@ -458,6 +507,44 @@ func isExistsLine(line string) bool {
 // attempts.
 func (s *session) handlePendingFetch(c *imapConn) {
 	_ = s.fetchNewMessages(c)
+}
+
+// drainBackfill runs the queued one-time historical fetches. Called from the
+// watch loop only, so it shares the loop's conn without racing other I/O.
+// Stops when ctx is cancelled. On a transport error the subscription goes
+// back to the head of the queue and the error is returned so the loop can
+// reconnect.
+func (s *session) drainBackfill(ctx context.Context, c *imapConn) error {
+	for ctx.Err() == nil {
+		s.backfillMu.Lock()
+		if len(s.backfillQueue) == 0 {
+			s.backfillMu.Unlock()
+			return nil
+		}
+		sub := s.backfillQueue[0]
+		s.backfillQueue = s.backfillQueue[1:]
+		s.backfillMu.Unlock()
+		if err := s.runBackfill(c, sub); err != nil {
+			s.backfillMu.Lock()
+			s.backfillQueue = append([]*Subscription{sub}, s.backfillQueue...)
+			s.backfillMu.Unlock()
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *session) isSubscribed(sub *Subscription) bool {
+	s.subsMu.Lock()
+	defer s.subsMu.Unlock()
+	_, ok := s.subs[sub]
+	return ok
+}
+
+func (s *session) backfillPending() bool {
+	s.backfillMu.Lock()
+	defer s.backfillMu.Unlock()
+	return len(s.backfillQueue) > 0
 }
 
 // reconnect is the external reconnect entry point: stops the IDLE loop,
@@ -583,7 +670,28 @@ func (s *session) subscribe(f Filter) *Subscription {
 	s.subsMu.Lock()
 	s.subs[sub] = struct{}{}
 	s.subsByTo[tk] = append(s.subsByTo[tk], sub)
+	if s.sinceUIDInitialized.Load() {
+		sub.backfillMax = s.dispatchedMax
+	} else {
+		// No watermark: the live path fetches nothing, so backfill owns
+		// every UID.
+		sub.backfillMax = math.MaxUint32
+	}
 	s.subsMu.Unlock()
+
+	if f.Backfill && !f.Since.IsZero() {
+		s.backfillMu.Lock()
+		s.backfillQueue = append(s.backfillQueue, sub)
+		s.backfillMu.Unlock()
+		// Break the current IDLE round so the loop drains the queue now;
+		// the poll loop picks it up on its next cycle.
+		s.idleMu.Lock()
+		cancel := s.idleRoundCancel
+		s.idleMu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
+	}
 
 	return sub
 }
@@ -629,6 +737,7 @@ func (s *session) dispatch(msg Message) {
 
 	s.subsMu.Lock()
 	defer s.subsMu.Unlock()
+	s.dispatchedMax = max(s.dispatchedMax, msg.UID)
 
 	// Two O(1) lookups: exact-To match and wildcards.
 	candidates := s.subsByTo[tk]

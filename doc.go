@@ -43,7 +43,8 @@
 //     catch-all share a single IMAP connection, not 2000.
 //   - UIDNEXT-based backlog skip: connecting to an inbox with a million
 //     stored messages costs the same as an empty one. emap never fetches
-//     mail older than the moment your session started.
+//     mail older than the moment your session started unless a
+//     subscription opts in with Filter.Backfill (bounded, per-subscriber).
 //   - IDLE-first: pushes from the server, not polling, when available.
 //     Falls back to configurable polling when the server doesn't support
 //     IDLE.

@@ -30,7 +30,8 @@ mailbox. With a typical IMAP client:
 
 **emap-go is designed around the fanout case from the ground up.** One
 persistent IMAP connection per credential, shared by every subscriber to that
-mailbox. No backlog fetch, ever. IDLE-first push delivery with polling
+mailbox. No backlog fetch unless a subscriber explicitly opts in
+(`Filter.Backfill`). IDLE-first push delivery with polling
 fallback. No third-party dependencies beyond the Go stdlib.
 
 ## Key advantages
@@ -248,7 +249,7 @@ emap.ConnCommandTimeout         // 30s — per-command read limit (does not appl
 | `Manager` | Connection pool. One per process. |
 | `Mailbox` | Credential-bound subscription factory; auto-closes on ctx cancel. |
 | `Subscription` | Live mail stream + Close; `Err()` says why the library closed `Ch`. |
-| `Filter` | To / FromContains / Since / MaxAge selectors. |
+| `Filter` | To / FromContains / Since / MaxAge selectors; opt-in `Backfill` for pre-existing mail since `Since`. |
 | `Message` | UID / To / From / Subject / Date / Body. |
 
 | Function | Purpose |
@@ -276,11 +277,18 @@ UIDNEXT (rare; non-conformant), emap-go **refuses to FETCH** rather than
 fall back to `FETCH 1:*` and pull the entire inbox. Better to deliver
 nothing than to dump 1M messages into memory.
 
+**Opt-in backfill.** A subscriber that sets `Filter.Backfill: true` with a
+non-zero `Since` additionally gets a one-time `UID SEARCH SINCE <Since − 1 day>`
+(narrowed by `TO`/`FROM` when `Filter.To`/`FromContains` are set) plus a FETCH of the newest 500
+hits, delivered to that subscriber only. The shared watermark is untouched,
+so other subscribers never see backlog. Useful when the mail you wait for
+may have landed before you subscribed (e.g. a key email hours later).
+
 See [ARCHITECTURE.md](ARCHITECTURE.md) for full design details.
 
 ## Status
 
-- 67 tests under `-race`, stable across repeated runs.
+- 72 tests under `-race`, stable across repeated runs.
 - No known leaks under 2000-subscription stress.
 - Production-grade in terms of correctness; not yet battle-tested at scale
   in the wild — please report issues.

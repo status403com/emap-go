@@ -22,6 +22,11 @@ import (
 // than reconnect (a fresh connection would hit the same rejection).
 var errIDLERejected = errors.New("server rejected IDLE")
 
+// errCommandRejected marks a tagged NO/BAD for a command: the server answered
+// and the connection is still in sync, so retrying on a fresh conn won't help.
+// Anything else from exec/execFetch is a transport error.
+var errCommandRejected = errors.New("server rejected command")
+
 // Tunable timeouts for the long-lived imapConn. Vars (not consts) so tests
 // can override without resorting to global mocks.
 var (
@@ -295,6 +300,31 @@ func (c *imapConn) logout() {
 	_, _, _ = c.exec("LOGOUT")
 }
 
+// uidSearch runs `UID SEARCH <criteria>` and returns the matching UIDs from
+// the untagged `* SEARCH` response(s). No matches → empty slice, nil.
+func (c *imapConn) uidSearch(criteria string) ([]uint32, error) {
+	tag, lines, err := c.exec("UID SEARCH " + criteria)
+	if err != nil {
+		return nil, err
+	}
+	if err := expectOK(tag, lines, "UID SEARCH"); err != nil {
+		return nil, fmt.Errorf("%w: %v", errCommandRejected, err)
+	}
+	var uids []uint32
+	for _, l := range lines {
+		const prefix = "* SEARCH"
+		if !strings.HasPrefix(strings.ToUpper(l), prefix) {
+			continue
+		}
+		for _, f := range strings.Fields(l[len(prefix):]) {
+			if n, err := strconv.ParseUint(f, 10, 32); err == nil {
+				uids = append(uids, uint32(n))
+			}
+		}
+	}
+	return uids, nil
+}
+
 // execFetch sends a FETCH-shaped command and returns one rawFetchResp per
 // `* N FETCH (...)` line in the server response. FETCH responses inline
 // literal blocks (`{N}\r\n<bytes>`) that may contain arbitrary bytes,
@@ -324,7 +354,7 @@ func (c *imapConn) execFetch(cmd string) ([]rawFetchResp, error) {
 		}
 		if strings.HasPrefix(line, tag+" ") {
 			if !strings.Contains(line, " OK") {
-				return nil, fmt.Errorf("FETCH failed: %s", line)
+				return nil, fmt.Errorf("%w: FETCH failed: %s", errCommandRejected, line)
 			}
 			return responses, nil
 		}

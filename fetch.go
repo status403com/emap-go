@@ -2,9 +2,12 @@ package emap
 
 import (
 	"bytes"
+	"cmp"
+	"errors"
 	"fmt"
 	"net/mail"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -178,6 +181,94 @@ func (s *session) fetchNewMessages(c *imapConn) error {
 		}
 	}
 	return nil
+}
+
+// backfillMaxMessages caps a Filter.Backfill historical fetch to the newest
+// N matching UIDs so an opt-in backfill can never pull a whole inbox.
+const backfillMaxMessages = 500
+
+// imapDateLayout is the RFC 3501 `date` shape used by SEARCH SINCE.
+const imapDateLayout = "02-Jan-2006"
+
+// runBackfill performs sub's one-time historical fetch: UID SEARCH SINCE
+// the day before the filter's Since (narrowed by TO/FROM when set), FETCH the
+// newest backfillMaxMessages hits at or below sub.backfillMax, and deliver
+// matches to sub only. SINCE compares day-granular dates in the server's
+// timezone, which may lag Since's zone by up to a day — hence the extra day;
+// matchFilter applies the precise Since gate. UIDs above backfillMax were
+// dispatched after sub registered, so the live path already delivers them.
+// Never touches sinceUID.
+//
+// Returns only transport errors (the conn may be mid-response and must be
+// replaced); a server rejection drops this backfill and returns nil.
+func (s *session) runBackfill(c *imapConn, sub *Subscription) error {
+	if !s.isSubscribed(sub) {
+		return nil
+	}
+	f := sub.filter
+	criteria := "SINCE " + f.Since.AddDate(0, 0, -1).Format(imapDateLayout)
+	if f.To != "" {
+		criteria += ` TO "` + escapeQ(f.To) + `"`
+	}
+	if f.FromContains != "" {
+		// IMAP FROM is a case-insensitive substring match on the From header,
+		// a superset of FromContains; matchFilter re-checks below.
+		criteria += ` FROM "` + escapeQ(f.FromContains) + `"`
+	}
+	uids, err := c.uidSearch(criteria)
+	if err != nil {
+		return transportErr(err)
+	}
+	uids = slices.DeleteFunc(uids, func(u uint32) bool { return u > sub.backfillMax })
+	if len(uids) == 0 {
+		return nil
+	}
+	slices.SortFunc(uids, func(a, b uint32) int { return cmp.Compare(b, a) })
+	if len(uids) > backfillMaxMessages {
+		uids = uids[:backfillMaxMessages]
+	}
+	set := make([]string, len(uids))
+	for i, u := range uids {
+		set[i] = strconv.FormatUint(uint64(u), 10)
+	}
+	resps, err := c.execFetch("UID FETCH " + strings.Join(set, ",") +
+		" (UID INTERNALDATE BODY.PEEK[HEADER.FIELDS (TO FROM SUBJECT DATE)] BODY.PEEK[TEXT])")
+	if err != nil {
+		return transportErr(err)
+	}
+
+	now := time.Now()
+	tk := toKey(f.To)
+	var msgs []Message
+	for _, r := range resps {
+		msg := buildMessageFromFetch(r)
+		if tk != "" && toKey(msg.To) != tk {
+			continue
+		}
+		if matchFilter(f, msg, now) {
+			msgs = append(msgs, msg)
+		}
+	}
+	if len(msgs) == 0 {
+		return nil
+	}
+	s.subsMu.Lock()
+	defer s.subsMu.Unlock()
+	if _, live := s.subs[sub]; !live {
+		return nil
+	}
+	for _, msg := range msgs {
+		deliverOrDropOldest(sub.ch, msg)
+	}
+	return nil
+}
+
+// transportErr passes err through unless it is a server rejection.
+func transportErr(err error) error {
+	if errors.Is(err, errCommandRejected) {
+		return nil
+	}
+	return err
 }
 
 // buildMessageFromFetch converts a parsed FETCH response into the

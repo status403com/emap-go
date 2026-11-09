@@ -107,6 +107,23 @@ it on all standard servers), `sinceUIDInitialized` stays false and
 IDLE waiting for fresh arrivals; no backlog is ever pulled. Mail visibility
 is sacrificed in this edge case to preserve the "bounded memory" invariant.
 
+The one exception is opt-in: `Filter.Backfill` (with non-zero `Since`) queues
+the subscription for a one-time
+`UID SEARCH SINCE <Since − 1 day> [TO "<addr>"] [FROM "<substr>"]` (the extra
+day absorbs server-timezone skew; the exact `Since` gate still applies per
+message), capped to the newest `backfillMaxMessages` (500) UIDs, then
+`UID FETCH` of that set. It runs on the watch-loop goroutine (IDLE rounds are
+broken to drain it promptly), delivers only to the requesting subscription
+after the usual `matchFilter` gate, and never moves `sinceUID`.
+
+Exactly-once: at registration (under `subsMu`) the subscription records
+`dispatchedMax`, the highest UID already handed to `dispatch`. Backfill only
+delivers UIDs at or below it; anything higher reaches the subscription through
+the live path. A transport error mid-backfill requeues the subscription at the
+head of the queue and goes through the normal reconnect path (the conn may be
+mid-response); a server rejection (tagged NO/BAD) drops the backfill. Queued
+backfills for closed subscriptions are skipped, and draining stops on shutdown.
+
 ## Reconnect model
 
 | Error type | Detected via | Response |
@@ -132,6 +149,7 @@ milliseconds.
 | `session.idleRoundCancel` | `session.idleMu` Mutex |
 | `session.sinceUID`, `session.sinceUIDInitialized` | `atomic.Uint32` / `atomic.Bool` |
 | `session.pendingFetch` | `atomic.Bool` |
+| `session.backfillQueue` | `session.backfillMu` Mutex; drained only on the watch-loop goroutine |
 | `imapConn.execMu` | serializes ALL commands (incl. IDLE for its full duration) |
 | `imapConn.tagCtr` | unprotected, only accessed via exec while holding `execMu` |
 
